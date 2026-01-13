@@ -287,6 +287,6 @@ jobs:
           - [S3 Bucket Console](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
           - [CloudWatch Logs](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }})
           
-          ### 📦 Deployed Files
+          ###  Deployed Files
           $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -10)
           EOF
