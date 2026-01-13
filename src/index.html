@@ -1,1 +1,45 @@
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GHA S3 Deployment POC</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 AWS S3 CI/CD Pipeline POC</h1>
+            <p class="subtitle">Deployed via GitHub Actions</p>
+        </header>
+        
+        <main>
+            <section class="info-card">
+                <h2>Pipeline Features</h2>
+                <ul>
+                    <li>✅ Automated Security Scanning</li>
+                    <li>✅ Code Quality Checks</li>
+                    <li>✅ Asset Optimization</li>
+                    <li>✅ S3 Deployment</li>
+                    <li>✅ Smoke Testing</li>
+                    <li>✅ Automatic Rollback</li>
+                </ul>
+            </section>
+            
+            <section class="info-card">
+                <h2>Deployment Info</h2>
+                <p><strong>Version:</strong> <span id="version">1.0.0</span></p>
+                <p><strong>Build:</strong> <span id="build-time"></span></p>
+                <p><strong>Status:</strong> <span class="status-badge">Live</span></p>
+            </section>
+        </main>
+        
+        <footer>
+            <p>Powered by GitHub Actions & AWS S3</p>
+            <p class="build-info">Build: <span id="commit-sha">Loading...</span></p>
+        </footer>
+    </div>
+    
+    <script src="js/main.js"></script>
+</body>
+</html>
