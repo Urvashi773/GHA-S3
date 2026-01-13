@@ -15,6 +15,7 @@ permissions:
 
 env:
   BUCKET_NAME: gha-s3-website-poc
+  AWS_REGION: eu-north-1
 
 jobs:
   # -----------------------------
@@ -76,10 +77,8 @@ jobs:
           SHORT_SHA="${COMMIT_SHA:0:7}"
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           
-          # Replace placeholder in JS (if exists)
-          if [ -f src/js/main.js ]; then
-            sed -i "s/COMMIT_SHA_PLACEHOLDER/$SHORT_SHA/g" src/js/main.js
-          fi
+          # Replace placeholder in JS
+          sed -i "s/COMMIT_SHA_PLACEHOLDER/$SHORT_SHA/g" src/js/main.js
           
           # Create build info file
           cat > src/build-info.json << EOF
@@ -132,21 +131,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Verify AWS identity and configuration
+      - name: Verify AWS identity
         run: |
           echo "Verifying AWS credentials..."
           aws sts get-caller-identity
+          echo "Deploying to region: ${{ secrets.AWS_REGION }}"
           echo "Target bucket: ${{ env.BUCKET_NAME }}"
-          
-          # Verify bucket location
-          BUCKET_REGION=$(aws s3api get-bucket-location --bucket ${{ env.BUCKET_NAME }} --query 'LocationConstraint' --output text)
-          if [ "$BUCKET_REGION" == "None" ] || [ "$BUCKET_REGION" == "null" ]; then
-            BUCKET_REGION="us-east-1"
-          fi
-          echo "Bucket actual region: $BUCKET_REGION"
-          
-          # Store for later steps
-          echo "VERIFIED_REGION=$BUCKET_REGION" >> $GITHUB_ENV
 
       - name: Backup current version
         id: backup
@@ -194,103 +184,69 @@ jobs:
       - name: Get website URL
         id: website-url
         run: |
-          # Use verified region from environment
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
+          WEBSITE_URL=$(aws s3api get-bucket-website \
+            --bucket ${{ env.BUCKET_NAME }} \
+            --query '[WebsiteConfiguration.IndexDocument.Suffix]' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$WEBSITE_URL" ]; then
+            WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
+          fi
+          
           echo "url=$WEBSITE_URL" >> "$GITHUB_OUTPUT"
           echo "Website URL: $WEBSITE_URL"
 
       - name: Smoke test - Check website accessibility
         run: |
           echo "Running smoke test..."
-          # Use verified region from environment
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
           
-          echo "Testing URL: $WEBSITE_URL"
-          
-          # Wait for S3 to propagate
-          echo "Waiting for S3 propagation..."
-          sleep 10
+          # Wait a moment for S3 to propagate
+          sleep 5
           
           # Check if website is accessible
-          echo "Checking website accessibility..."
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL" 2>&1 || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL")
           
-          echo "HTTP Response Code: $HTTP_CODE"
-          
-          if [ "$HTTP_CODE" = "200" ]; then
+          if [ "$HTTP_CODE" -eq 200 ]; then
             echo "✅ Smoke test PASSED - Website is accessible (HTTP $HTTP_CODE)"
             
             # Additional checks
-            CONTENT=$(curl -s "$WEBSITE_URL" 2>&1)
-            if echo "$CONTENT" | grep -q -i "GHA\|deployment\|POC\|website\|html"; then
+            CONTENT=$(curl -s "$WEBSITE_URL")
+            if echo "$CONTENT" | grep -q "GHA S3 Deployment POC"; then
               echo "✅ Content validation PASSED"
             else
-              echo "⚠️ WARNING: Expected content patterns not found"
-              echo "First 200 characters of content:"
-              echo "$CONTENT" | head -c 200
+              echo "⚠️ WARNING: Expected content not found"
             fi
           else
             echo "❌ Smoke test FAILED - HTTP code: $HTTP_CODE"
-            echo ""
-            echo "Debugging information:"
-            echo "Attempting verbose curl..."
-            curl -v "$WEBSITE_URL" 2>&1 | head -30 || true
-            echo ""
-            echo "Checking bucket website configuration:"
-            aws s3api get-bucket-website --bucket ${{ env.BUCKET_NAME }} || echo "Website hosting not configured"
-            echo ""
-            echo "Checking bucket location:"
-            aws s3api get-bucket-location --bucket ${{ env.BUCKET_NAME }}
-            echo ""
-            echo "Verifying index.html exists:"
-            aws s3 ls s3://${{ env.BUCKET_NAME }}/index.html || echo "index.html not found"
             exit 1
           fi
 
       - name: Verify deployment
         run: |
           echo "Verifying deployed files..."
-          echo ""
           aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive
-          echo ""
           
           # Check critical files
-          CRITICAL_FILES=("index.html")
-          MISSING_FILES=()
-          
+          CRITICAL_FILES=("index.html" "css/style.css" "js/main.js")
           for file in "${CRITICAL_FILES[@]}"; do
             if aws s3 ls "s3://${{ env.BUCKET_NAME }}/$file" >/dev/null 2>&1; then
               echo "✅ $file exists"
             else
               echo "❌ $file is missing!"
-              MISSING_FILES+=("$file")
+              exit 1
             fi
           done
           
-          # Check optional files
-          OPTIONAL_FILES=("css/style.css" "js/main.js")
-          for file in "${OPTIONAL_FILES[@]}"; do
-            if aws s3 ls "s3://${{ env.BUCKET_NAME }}/$file" >/dev/null 2>&1; then
-              echo "✅ $file exists"
-            else
-              echo "ℹ️  $file not found (optional)"
-            fi
-          done
-          
-          if [ ${#MISSING_FILES[@]} -gt 0 ]; then
-            echo ""
-            echo "❌ Critical files missing: ${MISSING_FILES[*]}"
-            exit 1
-          fi
-          
-          echo ""
           echo "✅ All critical files verified"
 
       - name: Rollback on failure
         if: failure() && steps.backup.outputs.backup_time != ''
         run: |
           echo "❌ DEPLOYMENT FAILED - Initiating rollback..."
-          echo ""
+          
+          # In a real scenario, you would restore from a backup bucket
+          # or use S3 versioning to restore previous versions
           echo "Rollback process:"
           echo "1. List object versions"
           aws s3api list-object-versions \
@@ -298,21 +254,19 @@ jobs:
             --prefix index.html \
             --max-items 5 || true
           
-          echo ""
           echo "⚠️ Manual rollback may be required"
           echo "Backup timestamp: ${{ steps.backup.outputs.backup_time }}"
 
       - name: Create deployment summary
         if: success()
         run: |
-          # Use verified region
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
           
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🚀 S3 Deployment Successful
           
           **Bucket**: \`${{ env.BUCKET_NAME }}\`
-          **Region**: \`${VERIFIED_REGION}\`
+          **Region**: \`${{ secrets.AWS_REGION }}\`
           **Commit**: \`${{ github.sha }}\`
           **Branch**: \`${{ github.ref_name }}\`
           **Deployed by**: \`${{ github.actor }}\`
@@ -328,11 +282,9 @@ jobs:
           **Live Site**: [$WEBSITE_URL]($WEBSITE_URL)
           
           ### 🔗 Quick Links
-          - [S3 Bucket Console](https://${VERIFIED_REGION}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
-          - [CloudWatch Logs](https://${VERIFIED_REGION}.console.aws.amazon.com/cloudwatch/home?region=${VERIFIED_REGION})
+          - [S3 Bucket Console](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
+          - [CloudWatch Logs](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }})
           
           ### 📦 Deployed Files
-          \`\`\`
-          $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -20)
-          \`\`\`
+          $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -10)
           EOF
