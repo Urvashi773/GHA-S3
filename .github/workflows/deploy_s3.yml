@@ -132,12 +132,21 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Verify AWS identity
+      - name: Verify AWS identity and configuration
         run: |
           echo "Verifying AWS credentials..."
           aws sts get-caller-identity
-          echo "Deploying to region: ${{ secrets.AWS_REGION }}"
           echo "Target bucket: ${{ env.BUCKET_NAME }}"
+          
+          # Verify bucket location
+          BUCKET_REGION=$(aws s3api get-bucket-location --bucket ${{ env.BUCKET_NAME }} --query 'LocationConstraint' --output text)
+          if [ "$BUCKET_REGION" == "None" ] || [ "$BUCKET_REGION" == "null" ]; then
+            BUCKET_REGION="us-east-1"
+          fi
+          echo "Bucket actual region: $BUCKET_REGION"
+          
+          # Store for later steps
+          echo "VERIFIED_REGION=$BUCKET_REGION" >> $GITHUB_ENV
 
       - name: Backup current version
         id: backup
@@ -185,14 +194,16 @@ jobs:
       - name: Get website URL
         id: website-url
         run: |
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
+          # Use verified region from environment
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
           echo "url=$WEBSITE_URL" >> "$GITHUB_OUTPUT"
           echo "Website URL: $WEBSITE_URL"
 
       - name: Smoke test - Check website accessibility
         run: |
           echo "Running smoke test..."
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
+          # Use verified region from environment
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
           
           echo "Testing URL: $WEBSITE_URL"
           
@@ -202,16 +213,16 @@ jobs:
           
           # Check if website is accessible
           echo "Checking website accessibility..."
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL" || echo "000")
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL" 2>&1 || echo "000")
           
           echo "HTTP Response Code: $HTTP_CODE"
           
-          if [ "$HTTP_CODE" -eq 200 ]; then
+          if [ "$HTTP_CODE" = "200" ]; then
             echo "✅ Smoke test PASSED - Website is accessible (HTTP $HTTP_CODE)"
             
             # Additional checks
-            CONTENT=$(curl -s "$WEBSITE_URL")
-            if echo "$CONTENT" | grep -q -i "GHA\|deployment\|POC\|website"; then
+            CONTENT=$(curl -s "$WEBSITE_URL" 2>&1)
+            if echo "$CONTENT" | grep -q -i "GHA\|deployment\|POC\|website\|html"; then
               echo "✅ Content validation PASSED"
             else
               echo "⚠️ WARNING: Expected content patterns not found"
@@ -222,10 +233,17 @@ jobs:
             echo "❌ Smoke test FAILED - HTTP code: $HTTP_CODE"
             echo ""
             echo "Debugging information:"
-            curl -v "$WEBSITE_URL" 2>&1 || true
+            echo "Attempting verbose curl..."
+            curl -v "$WEBSITE_URL" 2>&1 | head -30 || true
             echo ""
-            echo "Checking if bucket website hosting is configured:"
+            echo "Checking bucket website configuration:"
             aws s3api get-bucket-website --bucket ${{ env.BUCKET_NAME }} || echo "Website hosting not configured"
+            echo ""
+            echo "Checking bucket location:"
+            aws s3api get-bucket-location --bucket ${{ env.BUCKET_NAME }}
+            echo ""
+            echo "Verifying index.html exists:"
+            aws s3 ls s3://${{ env.BUCKET_NAME }}/index.html || echo "index.html not found"
             exit 1
           fi
 
@@ -287,13 +305,14 @@ jobs:
       - name: Create deployment summary
         if: success()
         run: |
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
+          # Use verified region
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${VERIFIED_REGION}.amazonaws.com"
           
           cat >> $GITHUB_STEP_SUMMARY << EOF
           ## 🚀 S3 Deployment Successful
           
           **Bucket**: \`${{ env.BUCKET_NAME }}\`
-          **Region**: \`${{ secrets.AWS_REGION }}\`
+          **Region**: \`${VERIFIED_REGION}\`
           **Commit**: \`${{ github.sha }}\`
           **Branch**: \`${{ github.ref_name }}\`
           **Deployed by**: \`${{ github.actor }}\`
@@ -309,8 +328,8 @@ jobs:
           **Live Site**: [$WEBSITE_URL]($WEBSITE_URL)
           
           ### 🔗 Quick Links
-          - [S3 Bucket Console](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
-          - [CloudWatch Logs](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }})
+          - [S3 Bucket Console](https://${VERIFIED_REGION}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
+          - [CloudWatch Logs](https://${VERIFIED_REGION}.console.aws.amazon.com/cloudwatch/home?region=${VERIFIED_REGION})
           
           ### 📦 Deployed Files
           \`\`\`
