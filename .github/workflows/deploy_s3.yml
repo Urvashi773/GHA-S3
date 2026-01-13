@@ -199,7 +199,7 @@ jobs:
       - name: Smoke test - Check website accessibility
         run: |
           echo "Running smoke test..."
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ env.WEBSITE_REGION }}.amazonaws.com"
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website.${{ env.WEBSITE_REGION }}.amazonaws.com"
           echo "Testing : $WEBSITE_URL"
           
           # Wait a moment for S3 to propagate
