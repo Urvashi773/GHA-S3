@@ -1,3 +1,4 @@
+
 name: Deploy to AWS S3 (Production Ready)
 
 on:
@@ -15,12 +16,8 @@ permissions:
 
 env:
   BUCKET_NAME: gha-s3-website-poc
-  WEBSITE_REGION: eu-north-1
 
 jobs:
-  # -----------------------------
-  # JOB 1: Security & Code Quality
-  # -----------------------------
   security:
     name: Security & Code Quality
     runs-on: ubuntu-latest
@@ -33,35 +30,29 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Install security tools
+      - name: Install validation tools
         run: |
           npm install -g htmlhint stylelint stylelint-config-standard
-        continue-on-error: true
 
       - name: HTML validation
         run: |
           echo "Validating HTML files..."
           npx htmlhint src/**/*.html || true
-        continue-on-error: true
 
       - name: CSS validation
         run: |
           echo "Validating CSS files..."
           npx stylelint "src/**/*.css" --config-basedir . || true
-        continue-on-error: true
 
-      - name: Check for secrets
+      - name: Check for exposed secrets
         run: |
-          echo "Scanning for exposed secrets..."
+          echo "Scanning for exposed credentials..."
           if grep -r "AKIA" src/ 2>/dev/null; then
-            echo "⚠️ WARNING: Possible AWS credentials found!"
+            echo "WARNING: Possible AWS access key found."
             exit 1
           fi
-          echo "✅ No exposed secrets found"
+          echo "No exposed credentials detected."
 
-  # -----------------------------
-  # JOB 2: Build & Optimize
-  # -----------------------------
   build:
     name: Build & Optimize Assets
     runs-on: ubuntu-latest
@@ -70,17 +61,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Create build info
+      - name: Create build metadata
         run: |
           echo "Creating build metadata..."
           COMMIT_SHA="${{ github.sha }}"
           SHORT_SHA="${COMMIT_SHA:0:7}"
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          
+
           # Replace placeholder in JS
           sed -i "s/COMMIT_SHA_PLACEHOLDER/$SHORT_SHA/g" src/js/main.js
-          
-          # Create build info file
+
+          # Build info file
           cat > src/build-info.json << EOF
           {
             "commitSha": "$COMMIT_SHA",
@@ -90,18 +81,13 @@ jobs:
             "triggeredBy": "${{ github.actor }}"
           }
           EOF
-          
-          echo "Build info created"
 
       - name: Create deployment package
         run: |
           echo "Packaging website files..."
           mkdir -p dist
           cp -r src/* dist/
-          
-          echo "Package contents:"
           ls -lah dist/
-          tree dist/ || find dist/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -110,9 +96,6 @@ jobs:
           path: dist/
           retention-days: 30
 
-  # -----------------------------
-  # JOB 3: Deploy to AWS S3
-  # -----------------------------
   deploy:
     name: Deploy to S3
     runs-on: ubuntu-latest
@@ -135,157 +118,146 @@ jobs:
         run: |
           echo "Verifying AWS credentials..."
           aws sts get-caller-identity
-          echo "Deploying to region: ${{ secrets.AWS_REGION }}"
-          echo "Target bucket: ${{ env.BUCKET_NAME }}"
 
-      - name: Backup current version
-        id: backup
+      - name: Enable S3 static website hosting (idempotent)
         run: |
-          echo "Creating backup of current deployment..."
-          BACKUP_TIME=$(date +%Y%m%d-%H%M%S)
-          
-          # Check if bucket has content
-          if aws s3 ls s3://${{ env.BUCKET_NAME }}/index.html 2>/dev/null; then
-            echo "Creating backup tag..."
-            aws s3api put-object-tagging \
-              --bucket ${{ env.BUCKET_NAME }} \
-              --key index.html \
-              --tagging "TagSet=[{Key=backup,Value=$BACKUP_TIME}]" || true
-            echo "backup_time=$BACKUP_TIME" >> "$GITHUB_OUTPUT"
-            echo "Backup tag created: $BACKUP_TIME"
+          set -e
+          BUCKET="${{ env.BUCKET_NAME }}"
+          if ! aws s3api get-bucket-website --bucket "$BUCKET" >/dev/null 2>&1; then
+            echo "Enabling website hosting on bucket: $BUCKET"
+            aws s3api put-bucket-website \
+              --bucket "$BUCKET" \
+              --website-configuration '{
+                "IndexDocument": {"Suffix": "index.html"},
+                "ErrorDocument": {"Key": "error.html"}
+              }'
           else
-            echo "No existing deployment to backup"
-            echo "backup_time=" >> "$GITHUB_OUTPUT"
+            echo "Website hosting already enabled."
           fi
+        # S3 website endpoints are HTTP-only; use CloudFront for HTTPS. (AWS docs)  # [3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/HostingWebsiteOnS3Setup.html)
 
       - name: Deploy to S3
         run: |
-          echo "Deploying website to S3..."
-          
-          # Sync files with appropriate cache headers
-          aws s3 sync dist/ s3://${{ env.BUCKET_NAME }}/ \
+          BUCKET="${{ env.BUCKET_NAME }}"
+          echo "Syncing files to s3://$BUCKET/"
+          # Global TTL for HTML and misc assets
+          aws s3 sync dist/ "s3://$BUCKET/" \
             --delete \
             --cache-control "public, max-age=3600" \
             --metadata-directive REPLACE
-          
-          # Set longer cache for static assets
-          aws s3 cp s3://${{ env.BUCKET_NAME }}/css/ s3://${{ env.BUCKET_NAME }}/css/ \
-            --recursive \
-            --cache-control "public, max-age=31536000" \
-            --metadata-directive REPLACE || true
-          
-          aws s3 cp s3://${{ env.BUCKET_NAME }}/js/ s3://${{ env.BUCKET_NAME }}/js/ \
-            --recursive \
-            --cache-control "public, max-age=31536000" \
-            --metadata-directive REPLACE || true
-          
-          echo "✅ Deployment completed"
 
-      - name: Get website URL
-        id: website-url
+          # Longer TTL for static assets
+          aws s3 cp "s3://$BUCKET/css/" "s3://$BUCKET/css/" \
+            --recursive \
+            --cache-control "public, max-age=31536000" \
+            --metadata-directive REPLACE || true
+
+          aws s3 cp "s3://$BUCKET/js/" "s3://$BUCKET/js/" \
+            --recursive \
+            --cache-control "public, max-age=31536000" \
+            --metadata-directive REPLACE || true
+
+          echo "Deployment to S3 completed."
+
+      - name: Resolve S3 website endpoint automatically
+        id: resolve-endpoint
         run: |
-          WEBSITE_URL=$(aws s3api get-bucket-website \
-            --bucket ${{ env.BUCKET_NAME }} \
-            --query '[WebsiteConfiguration.IndexDocument.Suffix]' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -z "$WEBSITE_URL" ]; then
-            WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
+          set -e
+          BUCKET="${{ env.BUCKET_NAME }}"
+
+          REGION=$(aws s3api get-bucket-location --bucket "$BUCKET" --query 'LocationConstraint' --output text)
+          if [ "$REGION" = "None" ] || [ -z "$REGION" ]; then REGION="us-east-1"; fi
+
+          CANDIDATE1="http://${BUCKET}.s3-website-${REGION}.amazonaws.com"
+          CANDIDATE2="http://${BUCKET}.s3-website.${REGION}.amazonaws.com"
+
+          echo "Testing candidate endpoints:"
+          echo "  1) $CANDIDATE1"
+          CODE1=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$CANDIDATE1" || echo "000")
+
+          if [ "$CODE1" != "000" ]; then
+            WEBSITE_URL="$CANDIDATE1"
+          else
+            echo "  2) $CANDIDATE2"
+            CODE2=$(curl -s -o /dev/null -w "%{http_code}" --max-time 8 "$CANDIDATE2" || echo "000")
+            WEBSITE_URL="$CANDIDATE2"
           fi
-          
-          echo "url=$WEBSITE_URL" >> "$GITHUB_OUTPUT"
-          echo "Website URL: $WEBSITE_URL"
 
-      - name: Smoke test - Check website accessibility
+          echo "url=$WEBSITE_URL" >> "$GITHUB_OUTPUT"
+          echo "Resolved website URL: $WEBSITE_URL"
+        # Endpoint formats vary by region (hyphen vs dot). (AWS docs)  # [2](https://docs.aws.amazon.com/AmazonS3/latest/userguide/WebsiteEndpoints.html)
+
+      - name: Smoke test - website accessibility
         run: |
-          echo "Running smoke test..."
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website.${{ env.WEBSITE_REGION }}.amazonaws.com"
-          echo "Testing : $WEBSITE_URL"
-          
-          # Wait a moment for S3 to propagate
-          sleep 5
-          
-          # Check if website is accessible
+          WEBSITE_URL="${{ steps.resolve-endpoint.outputs.url }}"
+          echo "Running smoke test: $WEBSITE_URL"
+          sleep 8
+
           HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL")
-          
+          echo "HTTP code: $HTTP_CODE"
+
           if [ "$HTTP_CODE" -eq 200 ]; then
-            echo "✅ Smoke test PASSED - Website is accessible (HTTP $HTTP_CODE)"
-            
-            # Additional checks
             CONTENT=$(curl -s "$WEBSITE_URL")
             if echo "$CONTENT" | grep -q "GHA S3 Deployment POC"; then
-              echo "✅ Content validation PASSED"
+              echo "Content validation passed."
             else
-              echo "⚠️ WARNING: Expected content not found"
+              echo "Warning: Expected content string not found."
             fi
           else
-            echo "❌ Smoke test FAILED - HTTP code: $HTTP_CODE"
+            echo "Smoke test failed. HTTP code: $HTTP_CODE"
+            echo "Listing bucket contents for diagnostics:"
+            aws s3 ls "s3://${{ env.BUCKET_NAME }}/" --recursive || true
             exit 1
           fi
 
-      - name: Verify deployment
+      - name: Verify critical files
         run: |
-          echo "Verifying deployed files..."
-          aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive
-          
-          # Check critical files
-          CRITICAL_FILES=("index.html" "css/style.css" "js/main.js")
-          for file in "${CRITICAL_FILES[@]}"; do
-            if aws s3 ls "s3://${{ env.BUCKET_NAME }}/$file" >/dev/null 2>&1; then
-              echo "✅ $file exists"
+          BUCKET="${{ env.BUCKET_NAME }}"
+          echo "Verifying critical files..."
+          for f in index.html css/style.css js/main.js; do
+            if aws s3 ls "s3://$BUCKET/$f" >/dev/null 2>&1; then
+              echo "Verified: $f"
             else
-              echo "❌ $file is missing!"
+              echo "Missing: $f"
               exit 1
             fi
           done
-          
-          echo "✅ All critical files verified"
+          echo "All critical files verified."
 
-      - name: Rollback on failure
-        if: failure() && steps.backup.outputs.backup_time != ''
+      # Optional: invalidate CloudFront cache if a distribution ID is provided
+      - name: CloudFront invalidation (optional)
+        if: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID != '' }}
         run: |
-          echo "❌ DEPLOYMENT FAILED - Initiating rollback..."
-          
-          # In a real scenario, you would restore from a backup bucket
-          # or use S3 versioning to restore previous versions
-          echo "Rollback process:"
-          echo "1. List object versions"
-          aws s3api list-object-versions \
-            --bucket ${{ env.BUCKET_NAME }} \
-            --prefix index.html \
-            --max-items 5 || true
-          
-          echo "⚠️ Manual rollback may be required"
-          echo "Backup timestamp: ${{ steps.backup.outputs.backup_time }}"
+          DIST_ID="${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}"
+          echo "Creating CloudFront invalidation on distribution $DIST_ID"
+          aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*"
+        # Use CloudFront to serve HTTPS and CDN caching. (AWS docs)  # [3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/HostingWebsiteOnS3Setup.html)
 
-      - name: Create deployment summary
+      - name: Deployment summary
         if: success()
         run: |
-          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
-          
+          WEBSITE_URL="${{ steps.resolve-endpoint.outputs.url }}"
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          ## 🚀 S3 Deployment Successful
-          
-          **Bucket**: \`${{ env.BUCKET_NAME }}\`
-          **Region**: \`${{ secrets.AWS_REGION }}\`
-          **Commit**: \`${{ github.sha }}\`
-          **Branch**: \`${{ github.ref_name }}\`
-          **Deployed by**: \`${{ github.actor }}\`
+          ## S3 Deployment Successful
+
+          **Bucket**: \`${{ env.BUCKET_NAME }}\`  
+          **Website URL**: ${WEBSITE_URL}  
+          **Region (bucket)**: $(aws s3api get-bucket-location --bucket "${{ env.BUCKET_NAME }}" --query 'LocationConstraint' --output text)  
+          **Commit**: \`${{ github.sha }}\`  
+          **Branch**: \`${{ github.ref_name }}\`  
+          **Deployed by**: \`${{ github.actor }}\`  
           **Timestamp**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          
-          ### 📊 Status
-          - ✅ Security scan: Completed
-          - ✅ Build: Successful
-          - ✅ Deployment: Successful
-          - ✅ Smoke tests: PASSED
-          
-          ### 🌐 Website URL
-          **Live Site**: [$WEBSITE_URL]($WEBSITE_URL)
-          
-          ### 🔗 Quick Links
-          - [S3 Bucket Console](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }})
-          - [CloudWatch Logs](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }})
-          
-          ### 📦 Deployed Files
-          $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -10)
+
+          ### Status
+          - Security & Quality: Completed
+          - Build: Successful
+          - Deploy: Successful
+          - Smoke Test: PASSED
+
+          ### Quick Links
+          - S3 Bucket: https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/s3/buckets/${{ env.BUCKET_NAME }}
+          - CloudWatch (region console): https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }}
+
+          ### Recent Files
+          $(aws s3 ls "s3://${{ env.BUCKET_NAME }}/" --recursive | head -10)
           EOF
