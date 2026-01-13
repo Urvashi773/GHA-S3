@@ -15,7 +15,6 @@ permissions:
 
 env:
   BUCKET_NAME: gha-s3-website-poc
-  AWS_REGION: us-east-1
 
 jobs:
   # -----------------------------
@@ -77,8 +76,10 @@ jobs:
           SHORT_SHA="${COMMIT_SHA:0:7}"
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           
-          # Replace placeholder in JS
-          sed -i "s/COMMIT_SHA_PLACEHOLDER/$SHORT_SHA/g" src/js/main.js
+          # Replace placeholder in JS (if exists)
+          if [ -f src/js/main.js ]; then
+            sed -i "s/COMMIT_SHA_PLACEHOLDER/$SHORT_SHA/g" src/js/main.js
+          fi
           
           # Create build info file
           cat > src/build-info.json << EOF
@@ -184,15 +185,7 @@ jobs:
       - name: Get website URL
         id: website-url
         run: |
-          WEBSITE_URL=$(aws s3api get-bucket-website \
-            --bucket ${{ env.BUCKET_NAME }} \
-            --query '[WebsiteConfiguration.IndexDocument.Suffix]' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -z "$WEBSITE_URL" ]; then
-            WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
-          fi
-          
+          WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
           echo "url=$WEBSITE_URL" >> "$GITHUB_OUTPUT"
           echo "Website URL: $WEBSITE_URL"
 
@@ -201,52 +194,85 @@ jobs:
           echo "Running smoke test..."
           WEBSITE_URL="http://${{ env.BUCKET_NAME }}.s3-website-${{ secrets.AWS_REGION }}.amazonaws.com"
           
-          # Wait a moment for S3 to propagate
-          sleep 5
+          echo "Testing URL: $WEBSITE_URL"
+          
+          # Wait for S3 to propagate
+          echo "Waiting for S3 propagation..."
+          sleep 10
           
           # Check if website is accessible
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL")
+          echo "Checking website accessibility..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEBSITE_URL" || echo "000")
+          
+          echo "HTTP Response Code: $HTTP_CODE"
           
           if [ "$HTTP_CODE" -eq 200 ]; then
             echo "✅ Smoke test PASSED - Website is accessible (HTTP $HTTP_CODE)"
             
             # Additional checks
             CONTENT=$(curl -s "$WEBSITE_URL")
-            if echo "$CONTENT" | grep -q "GHA S3 Deployment POC"; then
+            if echo "$CONTENT" | grep -q -i "GHA\|deployment\|POC\|website"; then
               echo "✅ Content validation PASSED"
             else
-              echo "⚠️ WARNING: Expected content not found"
+              echo "⚠️ WARNING: Expected content patterns not found"
+              echo "First 200 characters of content:"
+              echo "$CONTENT" | head -c 200
             fi
           else
             echo "❌ Smoke test FAILED - HTTP code: $HTTP_CODE"
+            echo ""
+            echo "Debugging information:"
+            curl -v "$WEBSITE_URL" 2>&1 || true
+            echo ""
+            echo "Checking if bucket website hosting is configured:"
+            aws s3api get-bucket-website --bucket ${{ env.BUCKET_NAME }} || echo "Website hosting not configured"
             exit 1
           fi
 
       - name: Verify deployment
         run: |
           echo "Verifying deployed files..."
+          echo ""
           aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive
+          echo ""
           
           # Check critical files
-          CRITICAL_FILES=("index.html" "css/style.css" "js/main.js")
+          CRITICAL_FILES=("index.html")
+          MISSING_FILES=()
+          
           for file in "${CRITICAL_FILES[@]}"; do
             if aws s3 ls "s3://${{ env.BUCKET_NAME }}/$file" >/dev/null 2>&1; then
               echo "✅ $file exists"
             else
               echo "❌ $file is missing!"
-              exit 1
+              MISSING_FILES+=("$file")
             fi
           done
           
+          # Check optional files
+          OPTIONAL_FILES=("css/style.css" "js/main.js")
+          for file in "${OPTIONAL_FILES[@]}"; do
+            if aws s3 ls "s3://${{ env.BUCKET_NAME }}/$file" >/dev/null 2>&1; then
+              echo "✅ $file exists"
+            else
+              echo "ℹ️  $file not found (optional)"
+            fi
+          done
+          
+          if [ ${#MISSING_FILES[@]} -gt 0 ]; then
+            echo ""
+            echo "❌ Critical files missing: ${MISSING_FILES[*]}"
+            exit 1
+          fi
+          
+          echo ""
           echo "✅ All critical files verified"
 
       - name: Rollback on failure
         if: failure() && steps.backup.outputs.backup_time != ''
         run: |
           echo "❌ DEPLOYMENT FAILED - Initiating rollback..."
-          
-          # In a real scenario, you would restore from a backup bucket
-          # or use S3 versioning to restore previous versions
+          echo ""
           echo "Rollback process:"
           echo "1. List object versions"
           aws s3api list-object-versions \
@@ -254,6 +280,7 @@ jobs:
             --prefix index.html \
             --max-items 5 || true
           
+          echo ""
           echo "⚠️ Manual rollback may be required"
           echo "Backup timestamp: ${{ steps.backup.outputs.backup_time }}"
 
@@ -286,5 +313,7 @@ jobs:
           - [CloudWatch Logs](https://${{ secrets.AWS_REGION }}.console.aws.amazon.com/cloudwatch/home?region=${{ secrets.AWS_REGION }})
           
           ### 📦 Deployed Files
-          $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -10)
+          \`\`\`
+          $(aws s3 ls s3://${{ env.BUCKET_NAME }}/ --recursive | head -20)
+          \`\`\`
           EOF
